@@ -10,15 +10,12 @@ import os
 from dotenv import load_dotenv
 from loguru import logger
 
-from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
-from pipecat.audio.turn.smart_turn.local_smart_turn_v2 import LocalSmartTurnAnalyzerV2
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
-from pipecat.services.cartesia.tts import CartesiaTTSService
+from pipecat.services.asyncai.tts import AsyncAITTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
@@ -27,22 +24,6 @@ from pipecat.transports.services.daily import DailyParams
 
 load_dotenv(override=True)
 
-# To use this locally, set the environment variable LOCAL_SMART_TURN_MODEL_PATH
-# to the path where the smart-turn repo is cloned.
-#
-# Example setup:
-#
-#   # Git LFS (Large File Storage)
-#   brew install git-lfs
-#   # Hugging Face uses LFS to store large model files, including .mlpackage
-#   git lfs install
-#   # Clone the repo with the smart_turn_classifier.mlpackage
-#   git clone https://huggingface.co/pipecat-ai/smart-turn-v2
-#
-# Then set the env variable:
-#   export LOCAL_SMART_TURN_MODEL_PATH=./smart-turn
-# or add it to your .env file
-smart_turn_model_path = os.getenv("LOCAL_SMART_TURN_MODEL_PATH")
 
 # We store functions so objects (e.g. SileroVADAnalyzer) don't get
 # instantiated. The function will be called when the desired transport gets
@@ -51,26 +32,17 @@ transport_params = {
     "daily": lambda: DailyParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
-        turn_analyzer=LocalSmartTurnAnalyzerV2(
-            smart_turn_model_path=smart_turn_model_path, params=SmartTurnParams()
-        ),
+        vad_analyzer=SileroVADAnalyzer(),
     ),
     "twilio": lambda: FastAPIWebsocketParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
-        turn_analyzer=LocalSmartTurnAnalyzerV2(
-            smart_turn_model_path=smart_turn_model_path, params=SmartTurnParams()
-        ),
+        vad_analyzer=SileroVADAnalyzer(),
     ),
     "webrtc": lambda: TransportParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
-        turn_analyzer=LocalSmartTurnAnalyzerV2(
-            smart_turn_model_path=smart_turn_model_path, params=SmartTurnParams()
-        ),
+        vad_analyzer=SileroVADAnalyzer(),
     ),
 }
 
@@ -80,9 +52,9 @@ async def run_example(transport: BaseTransport, _: argparse.Namespace, handle_si
 
     stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
 
-    tts = CartesiaTTSService(
-        api_key=os.getenv("CARTESIA_API_KEY"),
-        voice_id="71a7ad14-091c-4e8e-a314-022ece01c121",  # British Reading Lady
+    tts = AsyncAITTSService(
+        api_key=os.getenv("ASYNCAI_API_KEY", ""),
+        voice_id=os.getenv("ASYNCAI_VOICE_ID", "e0f39dc4-f691-4e78-bba5-5c636692cc04"),
     )
 
     llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))

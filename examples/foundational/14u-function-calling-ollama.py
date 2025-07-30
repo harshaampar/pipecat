@@ -10,16 +10,18 @@ import os
 from dotenv import load_dotenv
 from loguru import logger
 
-from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
-from pipecat.audio.turn.smart_turn.local_smart_turn_v2 import LocalSmartTurnAnalyzerV2
+from pipecat.adapters.schemas.function_schema import FunctionSchema
+from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.audio.vad.vad_analyzer import VADParams
+from pipecat.frames.frames import TTSSpeakFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.llm_service import FunctionCallParams
+from pipecat.services.ollama.llm import OLLamaLLMService
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.network.fastapi_websocket import FastAPIWebsocketParams
@@ -27,22 +29,14 @@ from pipecat.transports.services.daily import DailyParams
 
 load_dotenv(override=True)
 
-# To use this locally, set the environment variable LOCAL_SMART_TURN_MODEL_PATH
-# to the path where the smart-turn repo is cloned.
-#
-# Example setup:
-#
-#   # Git LFS (Large File Storage)
-#   brew install git-lfs
-#   # Hugging Face uses LFS to store large model files, including .mlpackage
-#   git lfs install
-#   # Clone the repo with the smart_turn_classifier.mlpackage
-#   git clone https://huggingface.co/pipecat-ai/smart-turn-v2
-#
-# Then set the env variable:
-#   export LOCAL_SMART_TURN_MODEL_PATH=./smart-turn
-# or add it to your .env file
-smart_turn_model_path = os.getenv("LOCAL_SMART_TURN_MODEL_PATH")
+
+async def fetch_weather_from_api(params: FunctionCallParams):
+    await params.result_callback({"conditions": "nice", "temperature": "75"})
+
+
+async def fetch_restaurant_recommendation(params: FunctionCallParams):
+    await params.result_callback({"name": "The Golden Dragon"})
+
 
 # We store functions so objects (e.g. SileroVADAnalyzer) don't get
 # instantiated. The function will be called when the desired transport gets
@@ -51,26 +45,17 @@ transport_params = {
     "daily": lambda: DailyParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
-        turn_analyzer=LocalSmartTurnAnalyzerV2(
-            smart_turn_model_path=smart_turn_model_path, params=SmartTurnParams()
-        ),
+        vad_analyzer=SileroVADAnalyzer(),
     ),
     "twilio": lambda: FastAPIWebsocketParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
-        turn_analyzer=LocalSmartTurnAnalyzerV2(
-            smart_turn_model_path=smart_turn_model_path, params=SmartTurnParams()
-        ),
+        vad_analyzer=SileroVADAnalyzer(),
     ),
     "webrtc": lambda: TransportParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
-        turn_analyzer=LocalSmartTurnAnalyzerV2(
-            smart_turn_model_path=smart_turn_model_path, params=SmartTurnParams()
-        ),
+        vad_analyzer=SileroVADAnalyzer(),
     ),
 }
 
@@ -85,7 +70,45 @@ async def run_example(transport: BaseTransport, _: argparse.Namespace, handle_si
         voice_id="71a7ad14-091c-4e8e-a314-022ece01c121",  # British Reading Lady
     )
 
-    llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
+    llm = OLLamaLLMService(model="llama3.2")  # Update to the model you're running locally
+
+    # You can also register a function_name of None to get all functions
+    # sent to the same callback with an additional function_name parameter.
+    llm.register_function("get_current_weather", fetch_weather_from_api)
+    llm.register_function("get_restaurant_recommendation", fetch_restaurant_recommendation)
+
+    @llm.event_handler("on_function_calls_started")
+    async def on_function_calls_started(service, function_calls):
+        await tts.queue_frame(TTSSpeakFrame("Let me check on that."))
+
+    weather_function = FunctionSchema(
+        name="get_current_weather",
+        description="Get the current weather",
+        properties={
+            "location": {
+                "type": "string",
+                "description": "The city and state, e.g. San Francisco, CA",
+            },
+            "format": {
+                "type": "string",
+                "enum": ["celsius", "fahrenheit"],
+                "description": "The temperature unit to use. Infer this from the user's location.",
+            },
+        },
+        required=["location", "format"],
+    )
+    restaurant_function = FunctionSchema(
+        name="get_restaurant_recommendation",
+        description="Get a restaurant recommendation",
+        properties={
+            "location": {
+                "type": "string",
+                "description": "The city and state, e.g. San Francisco, CA",
+            },
+        },
+        required=["location"],
+    )
+    tools = ToolsSchema(standard_tools=[weather_function, restaurant_function])
 
     messages = [
         {
@@ -94,18 +117,18 @@ async def run_example(transport: BaseTransport, _: argparse.Namespace, handle_si
         },
     ]
 
-    context = OpenAILLMContext(messages)
+    context = OpenAILLMContext(messages, tools)
     context_aggregator = llm.create_context_aggregator(context)
 
     pipeline = Pipeline(
         [
-            transport.input(),  # Transport user input
+            transport.input(),
             stt,
-            context_aggregator.user(),  # User responses
-            llm,  # LLM
-            tts,  # TTS
-            transport.output(),  # Transport bot output
-            context_aggregator.assistant(),  # Assistant spoken responses
+            context_aggregator.user(),
+            llm,
+            tts,
+            transport.output(),
+            context_aggregator.assistant(),
         ]
     )
 
@@ -121,7 +144,6 @@ async def run_example(transport: BaseTransport, _: argparse.Namespace, handle_si
     async def on_client_connected(transport, client):
         logger.info(f"Client connected")
         # Kick off the conversation.
-        messages.append({"role": "system", "content": "Please introduce yourself to the user."})
         await task.queue_frames([context_aggregator.user().get_context_frame()])
 
     @transport.event_handler("on_client_disconnected")

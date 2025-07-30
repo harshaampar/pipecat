@@ -16,8 +16,8 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
+from pipecat.services.asyncai.tts import AsyncAIHttpTTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService
-from pipecat.services.neuphonic.tts import NeuphonicHttpTTSService
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.network.fastapi_websocket import FastAPIWebsocketParams
@@ -55,9 +55,9 @@ async def run_example(transport: BaseTransport, _: argparse.Namespace, handle_si
     async with aiohttp.ClientSession() as session:
         stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
 
-        tts = NeuphonicHttpTTSService(
-            api_key=os.getenv("NEUPHONIC_API_KEY"),
-            voice_id="fc854436-2dac-4d21-aa69-ae17b54e98eb",  # Emily
+        tts = AsyncAIHttpTTSService(
+            api_key=os.getenv("ASYNCAI_API_KEY", ""),
+            voice_id=os.getenv("ASYNCAI_VOICE_ID", "e0f39dc4-f691-4e78-bba5-5c636692cc04"),
             aiohttp_session=session,
         )
 

@@ -5,7 +5,179 @@ All notable changes to **Pipecat** will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.0.75] - 2025-07-08
+## [Unreleased]
+
+### Added
+
+- Added Async.ai TTS integration (https://async.ai/)
+  - `AsyncAITTSService` – WebSocket-based streaming TTS with interruption support
+  - `AsyncAIHttpTTSService` – HTTP-based streaming TTS service
+  - Example scripts:
+    - `examples/foundational/07ac-interruptible-asyncai.py` (WebSocket demo)
+    - `examples/foundational/07ac-interruptible-asyncai-http.py` (HTTP demo)
+
+- Added `transcription_bucket` params support to the `DailyRESTHelper`.
+
+- Added a new TTS service, `InworldTTSService`. This service provides
+  low-latency, high-quality speech generation using Inworld's streaming API.
+
+- Added a new field `handle_sigterm` to `PipelineRunner`. It defaults to `False`.
+  This field handles SIGTERM signals. The `handle_sigint` field still defaults
+  to `True`, but now it handles only SIGINT signals.
+
+- Added foundational example `14u-function-calling-ollama.py` for Ollama
+  function calling.
+
+- Added `LocalSmartTurnAnalyzerV2`, which supports local on-device inference
+  with the new `smart-turn-v2` turn detection model.
+
+- Added `set_log_level` to `DailyTransport`, allowing setting the logging level
+  for Daily's internal logging system.
+
+- Added `on_transcription_stopped` and `on_transcription_error` to Daily callbacks.
+
+### Changed
+
+- `STTMuteFilter` now pushes the `STTMuteFrame` upstream and downstream, to
+  allow for more flexible `STTMuteFilter` placement.
+
+- Play delayed messages from `ElevenLabsTTSService` if they still belong to the
+  current context.
+
+- Dependency compatibility improvements: Relaxed version constraints for core
+  dependencies to support broader version ranges while maintaining stability:
+
+  - `aiohttp`, `Markdown`, `nltk`, `numpy`, `Pillow`, `pydantic`, `openai`,
+    `numba`: Now support up to the next major version (e.g. `numpy>=1.26.4,<3`)
+  - `pyht`: Relaxed to `>=0.1.6` to resolve `grpcio` conflicts with
+    `nvidia-riva-client`
+  - `fastapi`: Updated to support versions `>=0.115.6,<0.117.0`
+  - `torch`/`torchaudio`: Changed from exact pinning (`==2.5.0`) to compatible
+    range (`~=2.5.0`)
+  - `aws_sdk_bedrock_runtime`: Added Python 3.12+ constraint via environment
+    marker
+  - `numba`: Reduced minimum version to `0.60.0` for better compatibility
+
+- Changed `NeuphonicHttpTTSService` to use a POST based request instead of the
+  `pyneuphonic` package. This removes a package requirement, allowing Neuphonic
+  to work with more services.
+
+- Updated `ElevenLabsTTSService` to handle the case where
+  `allow_interruptions=False`. Now, when interruptions are disabled, the same
+  context ID will be used throughout the conversation.
+
+- Updated the `deepgram` optional dependency to 4.7.0, which downgrades the
+  `tasks cancelled error` to a debug log. This removes the log from appearing
+  in Pipecat logs upon leaving.
+
+- Upgraded the `websockets` implementation to the new asyncio implementation.
+  Along with this change, we're updating support for versions >=13.1.0 and
+  <15.0.0. All services have been update to use the asyncio implementation.
+
+- Updated `MiniMaxHttpTTSService` with a `base_url` arg where you can specify
+  the Global endpoint (default) or Mainland China.
+
+- Replaced regex-based sentence detection in `match_endofsentence` with NLTK's
+  punkt_tab tokenizer for more reliable sentence boundary detection.
+
+- Changed the `livekit` optional dependency for `tenacity` to
+  `tenacity>=8.2.3,<10.0.0` in order to support the `google-genai` package.
+
+- For `LmntTTSService`, changed the default `model` to `blizzard`, LMNT's
+  recommended model.
+
+### Fixed
+
+- Fixed an issue in the `TranscriptProcessor` where newline characters could
+  cause the transcript output to be corrupted (e.g. missing all spaces).
+
+- Fixed an issue in `AudioBufferProcessor` when using `SmallWebRTCTransport` where, if
+  the microphone was muted, track timing was not respected.
+
+- Fixed an error that occurs when pushing an `LLMMessagesFrame`. Only some LLM
+  services, like Grok, are impacted by this issue. The fix is to remove the
+  optional `name` property that was being added to the message.
+
+- Fixed an issue in `AudioBufferProcessor` that caused garbled audio when
+  `enable_turn_audio` was enabled and audio resampling was required.
+
+- Fixed a dependency issue for uv users where an `llvmlite` version required
+  python 3.9.
+
+- Fixed an issue in `MiniMaxHttpTTSService` where the `pitch` param was the
+  incorrect type.
+
+- Fixed an issue with OpenTelemetry tracing where the `enable_tracing` flag did
+  not disable the internal tracing decorator functions.
+
+- Fixed an issue in `OLLamaLLMService` where kwargs were not passed correctly
+  to the parent class.
+
+- Fixed an issue in `ElevenLabsTTSService` where the word/timestamp pairs were
+  calculating word boundaries incorrectly.
+
+- Fixed an issue where, in some edge cases, the `EmulateUserStartedSpeakingFrame`
+  could be created even if we didn't have a transcription.
+
+- Fixed an issue in `GoogleLLMContext` where it would inject the
+  `system_message` as a "user" message into cases where it was not meant to;
+  it was only meant to do that when there were no "regular" (non-function-call)
+  messages in the context, to ensure that inference would run properly.
+
+- Fixed an issue in `LiveKitTransport` where the `on_audio_track_subscribed` was never emitted.
+
+### Other
+
+- Removed most of the examples from the pipecat repo. Examples can now be
+  found in: https://github.com/pipecat-ai/pipecat-examples.
+
+## [0.0.76] - 2025-07-11
+
+### Added
+
+- Added `SpeechControlParamsFrame`, a new `SystemFrame` that notifies
+  downstream processors of the VAD and Turn analyzer params. This frame is
+  pushed by the `BaseInputTransport` at Start and any time a
+  `VADParamsUpdateFrame` is received.
+
+### Changed
+
+- Two package dependencies have been updated:
+  - `numpy` now supports 1.26.0 and newer
+  - `transformers` now supports 4.48.0 and newer
+
+### Fixed
+
+- Fixed an issue with RTVI's handling of `append-to-context`.
+
+- Fixed an issue where using audio input with a sample rate requiring resampling
+  could result in empty audio being passed to STT services, causing errors.
+
+- Fixed the VAD analyzer to process the full audio buffer as long as it contains
+  more than the minimum required bytes per iteration, instead of only analyzing
+  the first chunk.
+
+- Fixed an issue in ParallelPipeline that caused errors when attempting to drain
+  the queues.
+
+- Fixed an issue with emulated VAD timeout inconsistency in
+  `LLMUserContextAggregator`. Previously, emulated VAD scenarios (where
+  transcription is received without VAD detection) used a hardcoded
+  `aggregation_timeout` (default 0.5s) instead of matching the VAD's
+  `stop_secs` parameter (default 0.8s). This created different user experiences
+  between real VAD and emulated VAD scenarios. Now, emulated VAD timeouts
+  automatically synchronize with the VAD's `stop_secs` parameter.
+
+- Fix a pipeline freeze when using AWS Nova Sonic, which would occur if the
+  user started early, while the bot was still working through
+  `trigger_assistant_response()`.
+
+## [0.0.75] - 2025-07-08 [YANKED]
+
+**This release has been yanked due to resampling issues affecting audio output
+quality and critical bugs impacting `ParallelPipelines` functionality.**
+
+**Please upgrade to version 0.0.76 or later.**
 
 ### Added
 
@@ -66,7 +238,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Remove unncessary push task in each `FrameProcessor`.
 
-## [0.0.74] - 2025-07-03
+## [0.0.74] - 2025-07-03 [YANKED]
+
+**This release has been yanked due to resampling issues affecting audio output
+quality and critical bugs impacting `ParallelPipelines` functionality.**
+
+**Please upgrade to version 0.0.76 or later.**
 
 ### Added
 
