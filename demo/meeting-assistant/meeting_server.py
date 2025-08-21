@@ -191,7 +191,9 @@ async def create_meeting_pipeline(transport: BaseTransport, meeting_id: str) -> 
         params=PipelineParams(
             enable_metrics=True,
             enable_usage_metrics=True,
+            allow_interruptions=True,
         ),
+        cancel_on_idle_timeout=False,  # Don't cancel on idle timeout for meetings
     )
     
     return task, transcript_processor
