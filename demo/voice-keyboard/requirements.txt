@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+websockets
+aiofiles
+python-dotenv
+loguru
+pipecat-ai[deepgram]
