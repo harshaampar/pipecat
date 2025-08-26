@@ -347,13 +347,30 @@ async def webrtc_offer(request: dict, background_tasks: BackgroundTasks):
                 # Stop the running session pipeline and transport immediately  
                 session_data = active_sessions.get(session_id)
                 if session_data:
-                    # Stop the transport first to immediately stop audio frame reading
+                    # Close WebRTC connection first to signal disconnect to ESP32
+                    if "webrtc_connection" in session_data:
+                        webrtc_connection = session_data["webrtc_connection"]
+                        logger.info(f"Closing WebRTC connection for {session_id}")
+                        try:
+                            await webrtc_connection.close()
+                            logger.info(f"WebRTC connection closed for {session_id}")
+                        except Exception as e:
+                            logger.warning(f"Error closing WebRTC connection: {e}")
+                    
+                    # Stop the transport to stop audio frame processing
                     if "transport" in session_data:
                         transport = session_data["transport"]
                         logger.info(f"Stopping transport for {session_id}")
                         try:
                             from pipecat.frames.frames import EndFrame
-                            await transport.stop(EndFrame())
+                            # SmallWebRTCTransport requires stopping input and output separately
+                            end_frame = EndFrame()
+                            if hasattr(transport, 'input') and transport.input():
+                                await transport.input().stop(end_frame)
+                                logger.info(f"Transport input stopped for {session_id}")
+                            if hasattr(transport, 'output') and transport.output():
+                                await transport.output().stop(end_frame)
+                                logger.info(f"Transport output stopped for {session_id}")
                             logger.info(f"Transport stopped successfully for {session_id}")
                         except Exception as e:
                             logger.warning(f"Error stopping transport: {e}")
