@@ -3,30 +3,30 @@ import asyncio
 import json
 import os
 import re
+import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, WebSocket, WebSocketDisconnect, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import BackgroundTasks, FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
 from deepgram import LiveOptions
+from openai import AsyncOpenAI
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import Frame, TranscriptionFrame
+from pipecat.frames.frames import TranscriptionFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
-from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.processors.frame_processor import FrameProcessor
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
-from pipecat.transports.network.fastapi_websocket import FastAPIWebsocketParams, FastAPIWebsocketTransport
 from pipecat.transports.network.small_webrtc import SmallWebRTCTransport
 from pipecat.transports.network.webrtc_connection import SmallWebRTCConnection
-from pipecat.transports.services.daily import DailyParams
 
 load_dotenv(override=True)
 
@@ -76,63 +76,286 @@ current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=current_dir / "static"), name="static")
 
 
-class TextSenderProcessor(FrameProcessor):
-    """Processor that sends transcribed text back to ESP32 via data channel"""
+class LatencyTracker:
+    """Track and calculate latency statistics"""
+    
+    def __init__(self, window_size: int = 10):
+        self.window_size = window_size
+        self.llm_latencies: List[float] = []
+        self.total_latencies: List[float] = []
+        
+    def record_latency(self, llm_ms: float, total_ms: float) -> Dict[str, float]:
+        """Record latency and return current stats"""
+        self.llm_latencies.append(llm_ms)
+        self.total_latencies.append(total_ms)
+        
+        # Keep only recent measurements
+        if len(self.llm_latencies) > self.window_size:
+            self.llm_latencies = self.llm_latencies[-self.window_size:]
+            self.total_latencies = self.total_latencies[-self.window_size:]
+        
+        return {
+            "llm_avg": sum(self.llm_latencies) / len(self.llm_latencies),
+            "total_avg": sum(self.total_latencies) / len(self.total_latencies),
+            "count": len(self.llm_latencies)
+        }
+
+
+class VoiceCommandProcessor(FrameProcessor):
+    """Processor that routes transcribed text through LLM for command analysis and sends results to ESP32"""
     
     def __init__(self, session_id: str, webrtc_connection: SmallWebRTCConnection):
         super().__init__()
         self.session_id = session_id
         self.webrtc_connection = webrtc_connection
+        self.latency_tracker = LatencyTracker()
+        
+        # Initialize OpenAI client for LLM analysis
+        self.openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        
+    async def analyze_command_with_llm(self, text: str) -> dict:
+        """Analyze text using OpenAI to determine if it contains commands"""
+        
+        command_list = """
+        Available keyboard commands (after "ESP" trigger):
+        - select all/everything → Cmd+A
+        - copy → Cmd+C  
+        - paste → Cmd+V
+        - cut → Cmd+X
+        - undo → Cmd+Z
+        - redo → Cmd+Shift+Z
+        - save → Cmd+S
+        - find → Cmd+F
+        - new → Cmd+N
+        - open → Cmd+O
+        - close → Cmd+W
+        - quit → Cmd+Q
+        - enter/return/new line/next line/go to next line → Enter key
+        - tab → Tab key
+        - backspace/delete last/delete previous character → Backspace key
+        - delete/delete next/delete character → Delete key
+        - delete word/delete previous word → Option+Backspace (Alt+Backspace)
+        - delete line/delete current line/clear line/delete the line → Cmd+Backspace
+        - clear/clear all → Cmd+A then Delete
+        - escape → Escape key
+        - space → Space key
+        - up/up arrow/scroll up → Up arrow
+        - down/down arrow/scroll down → Down arrow
+        - left/left arrow → Left arrow
+        - right/right arrow → Right arrow
+        - home → Home key
+        - end → End key
+        - page up → Page Up key
+        - page down → Page Down key
+        """
+        
+        prompt = f"""
+        You are a voice keyboard command parser. Analyze voice input for ESP keyboard commands.
+        
+        Input: "{text}"
+        
+        STRICT RULES:
+        1. ONLY trigger commands if input contains ESP variations: "ESP", "E S P", "E s p", "esp", "Esp", "ASP", "asp", "A S P", "A s p" (STT variations)
+        2. "ASAP", "ISP", etc. are NOT triggers - return as regular text
+        3. If no ESP trigger, return as regular text
+        4. If command after ESP is unclear or not in list below, return NO ACTION (not text)
+        5. IGNORE punctuation and trailing characters (commas, periods, etc.) when matching commands
+        6. Only use these EXACT command mappings:
+        
+        EXACT WORD MATCHING (case insensitive):
+        - "copy" → Cmd+C
+        - "paste" → Cmd+V  
+        - "cut" → Cmd+X
+        - "select all" OR "select everything" → Cmd+A
+        - "undo" → Cmd+Z
+        - "save" → Cmd+S
+        - "enter" OR "new line" OR "next line" → Enter key
+        - "backspace" → Backspace key
+        - "delete" → Delete key
+        - "tab" → Tab key
+        - "up" → Up arrow
+        - "down" → Down arrow
+        
+        IMPORTANT: Words like "done", "finished", "complete", "stop" are NOT commands!
+        
+        EXAMPLES:
+        - "ESP copy this" → {{"type": "command", "actions": [{{"type": "shortcut", "keys": ["cmd", "c"]}}]}}
+        - "E S P enter" → {{"type": "command", "actions": [{{"type": "key", "key": "enter"}}]}}
+        - "ESP backspace" → {{"type": "command", "actions": [{{"type": "key", "key": "backspace"}}]}}
+        - "ESP paste" → {{"type": "command", "actions": [{{"type": "shortcut", "keys": ["cmd", "v"]}}]}}
+        - "ESP select all" → {{"type": "command", "actions": [{{"type": "shortcut", "keys": ["cmd", "a"]}}]}}
+        - "Esp undo," → {{"type": "command", "actions": [{{"type": "shortcut", "keys": ["cmd", "z"]}}]}}
+        - "asp select all." → {{"type": "command", "actions": [{{"type": "shortcut", "keys": ["cmd", "a"]}}]}}
+        - "A s p select all," → {{"type": "command", "actions": [{{"type": "shortcut", "keys": ["cmd", "a"]}}]}}
+        - "Asp backspace," → {{"type": "command", "actions": [{{"type": "key", "key": "backspace"}}]}}
+        - "ESP copy." → {{"type": "command", "actions": [{{"type": "shortcut", "keys": ["cmd", "c"]}}]}}
+        - "ESP paste!" → {{"type": "command", "actions": [{{"type": "shortcut", "keys": ["cmd", "v"]}}]}}
+        - "ESP undo?" → {{"type": "command", "actions": [{{"type": "shortcut", "keys": ["cmd", "z"]}}]}}
+        
+        NEGATIVE EXAMPLES (return as regular text):
+        - "ASAP clear" → {{"type": "text"}}
+        - "Please copy this" → {{"type": "text"}}
+        - "The ESP board" → {{"type": "text"}}
+        
+        UNCLEAR COMMANDS (return no action):
+        - "ESP done" → {{"type": "no_action"}}
+        - "ESP finished" → {{"type": "no_action"}}
+        - "ESP stop" → {{"type": "no_action"}}
+        - "ESP complete" → {{"type": "no_action"}}
+        - "ESP delete line" → {{"type": "no_action"}}
+        - "ESP clear screen" → {{"type": "no_action"}}
+        - "ESP some unclear command" → {{"type": "no_action"}}
+        
+        RESPONSE FORMAT:
+        - Clear command: {{"type": "command", "actions": [...]}}
+        - Regular text: {{"type": "text"}}  
+        - Unclear/unsupported command: {{"type": "no_action"}}
+        
+        Respond with JSON only. When in doubt, use "no_action".
+        """
+        
+        try:
+            response = await self.openai_client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1
+            )
+            
+            response_text = response.choices[0].message.content.strip()
+            logger.debug(f"🤖 Raw LLM response for '{text}': {response_text}")
+            
+            # Parse JSON response
+            if response_text.startswith('```json'):
+                response_text = response_text[7:-3].strip()
+            elif response_text.startswith('```'):
+                response_text = response_text[3:-3].strip()
+                
+            result = json.loads(response_text)
+            logger.info(f"🎯 Parsed LLM result for '{text}': {result}")
+            return result
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"❌ JSON parsing error for '{text}': {e}")
+            logger.error(f"❌ Raw response was: {response_text}")
+            # Fallback: treat as regular text
+            return {"type": "text"}
+        except Exception as e:
+            logger.error(f"❌ Error analyzing command with LLM for '{text}': {e}")
+            # Fallback: treat as regular text
+            return {"type": "text"}
+        
+    async def send_to_esp32(self, message: Dict) -> None:
+        """Send message to ESP32 via WebRTC data channel"""
+        try:
+            if hasattr(self.webrtc_connection, 'send_message'):
+                self.webrtc_connection.send_message(message)
+            elif hasattr(self.webrtc_connection, 'send_app_message'):
+                result = self.webrtc_connection.send_app_message(message)
+                if result is not None and hasattr(result, '__await__'):
+                    await result
+            else:
+                # Fallback - try to send via data channel directly
+                self.webrtc_connection.send_data_channel_message(json.dumps(message))
+                
+        except Exception as e:
+            logger.error(f"❌ Error sending message to ESP32: {e}")
+            raise
         
     async def process_frame(self, frame, direction):
-        """Process transcription frames and send text to ESP32"""
-        # First, call the parent process_frame to handle StartFrame and other system frames
+        """Process transcription frames and send to ESP32"""
+        # Handle system frames
         await super().process_frame(frame, direction)
         
-        # Then handle our specific transcription logic
+        # Handle transcription frames
         if isinstance(frame, TranscriptionFrame) and frame.text.strip():
-            # Check if this is an interim or final transcription
             is_interim = getattr(frame, 'interim', False)
             
-            if not is_interim:  # Only send final transcriptions to ESP32
-                # Send text back to ESP32 via data channel with proper spacing
-                text_with_space = frame.text.strip()
-                if text_with_space:
-                    # Always add space after each transcription segment to separate words
-                    text_with_space += " "
+            if not is_interim:  # Only process final transcriptions
+                start_time = time.time()
+                logger.info(f"📝 [{self.session_id}] Transcription received: '{frame.text}'")
                 
-                text_message = {
-                    "type": "transcribed_text",
-                    "text": text_with_space
-                }
+                # LLM analysis for command detection
+                process_start = time.time()
+                llm_start = time.time()
                 
-                try:
-                    # Send text message via data channel - use the correct method
-                    if hasattr(self.webrtc_connection, 'send_message'):
-                        self.webrtc_connection.send_message(text_message)
-                    elif hasattr(self.webrtc_connection, 'send_app_message'):
-                        result = self.webrtc_connection.send_app_message(text_message)
-                        if result is not None and hasattr(result, '__await__'):
-                            await result
-                    else:
-                        # Fallback - try to send via data channel directly
-                        import json
-                        self.webrtc_connection.send_data_channel_message(json.dumps(text_message))
+                # Use LLM to analyze the transcription
+                llm_result = await self.analyze_command_with_llm(frame.text)
+                
+                llm_end = time.time()
+                llm_latency = (llm_end - llm_start) * 1000
+                
+                if llm_result.get("type") == "command" and "actions" in llm_result:
+                    # LLM detected a command
+                    actions = llm_result["actions"]
                     
-                    logger.info(f"📤 Sent text to ESP32: {frame.text.strip()}")
+                    message = {
+                        "type": "keyboard_command", 
+                        "actions": actions
+                    }
+                    
+                    send_start = time.time()
+                    await self.send_to_esp32(message)
+                    send_end = time.time()
+                    send_latency = (send_end - send_start) * 1000
+                    
+                    logger.info(f"📤 [{self.session_id}] Sent command to ESP32: {actions}")
                     
                     # Broadcast to web interface
                     await broadcast_session_update(self.session_id, {
                         "timestamp": datetime.now().isoformat(),
                         "text": frame.text,
-                        "type": "transcription_sent",
+                        "type": "command_sent",
+                        "actions": actions,
                         "streaming": False
                     })
+                elif llm_result.get("type") == "text":
+                    # LLM determined it's regular text
+                    send_start = time.time()
+                    await self._send_as_text(frame.text, process_start)
+                    send_end = time.time()
+                    send_latency = (send_end - send_start) * 1000
+                elif llm_result.get("type") == "no_action":
+                    # LLM determined command was unclear - do nothing
+                    send_start = time.time()
+                    send_end = time.time()
+                    send_latency = 0.0
                     
-                except Exception as e:
-                    logger.error(f"❌ Error sending text to ESP32: {e}")
-                    logger.debug(f"WebRTC connection type: {type(self.webrtc_connection)}")
-                    logger.debug(f"Available methods: {dir(self.webrtc_connection)}")
+                    logger.info(f"🚫 [{self.session_id}] LLM detected unclear ESP command - no action taken: '{frame.text}'")
+                    
+                    # Broadcast to web interface
+                    await broadcast_session_update(self.session_id, {
+                        "timestamp": datetime.now().isoformat(),
+                        "text": frame.text,
+                        "type": "no_action",
+                        "message": "Unclear command - no action taken",
+                        "streaming": False
+                    })
+                else:
+                    # Fallback to regular text if LLM response is unexpected
+                    send_start = time.time()
+                    await self._send_as_text(frame.text, process_start)
+                    send_end = time.time()
+                    send_latency = (send_end - send_start) * 1000
+                
+                # Calculate and log latency
+                total_latency = (time.time() - start_time) * 1000
+                process_latency = (time.time() - process_start) * 1000
+                
+                stats = self.latency_tracker.record_latency(llm_latency, total_latency)
+                
+                logger.info(f"⏱️ [{self.session_id}] LATENCY: LLM: {llm_latency:.1f}ms | Total: {total_latency:.1f}ms | Avg: {stats['total_avg']:.1f}ms")
+                
+                # Broadcast latency metrics
+                await broadcast_session_update(self.session_id, {
+                    "timestamp": datetime.now().isoformat(),
+                    "type": "latency_metrics",
+                    "llm_latency": llm_latency,
+                    "process_latency": process_latency,
+                    "send_latency": send_latency,
+                    "total_latency": total_latency,
+                    "avg_latency": stats["total_avg"],
+                    "count": stats["count"]
+                })
             else:
                 # For interim results, only broadcast to web interface
                 await broadcast_session_update(self.session_id, {
@@ -142,8 +365,32 @@ class TextSenderProcessor(FrameProcessor):
                     "streaming": True
                 })
         
-        # Always push the frame downstream
+        # Always push frame downstream
         await self.push_frame(frame, direction)
+    
+    async def _send_as_text(self, text: str, process_start_time: float):
+        """Helper to send text to ESP32"""
+        text_with_space = text.strip() + " "
+        
+        message = {
+            "type": "transcribed_text",
+            "text": text_with_space
+        }
+        
+        send_start = time.time()
+        await self.send_to_esp32(message)
+        send_end = time.time()
+        
+        logger.info(f"📤 [{self.session_id}] Sent text to ESP32: {text.strip()}")
+        
+        # Broadcast to web interface  
+        await broadcast_session_update(self.session_id, {
+            "timestamp": datetime.now().isoformat(),
+            "text": text,
+            "type": "transcription_sent", 
+            "streaming": False
+        })
+    
 
 
 # Transport configurations
@@ -172,14 +419,14 @@ async def create_voice_keyboard_pipeline(transport: BaseTransport, session_id: s
         )
     )
 
-    # Create text sender processor for this session
-    text_sender = TextSenderProcessor(session_id, webrtc_connection)
+    # Create voice command processor for this session
+    voice_processor = VoiceCommandProcessor(session_id, webrtc_connection)
     
-    # Build pipeline - simplified for transcription + text sending
+    # Build pipeline - transcription + LLM analysis + command/text handling
     pipeline = Pipeline([
         transport.input(),           # Transport user input (audio)
         stt,                        # Speech to text (Deepgram Nova-3)
-        text_sender,               # Send text back to ESP32
+        voice_processor,            # LLM analysis + send commands/text to ESP32
     ])
 
     task = PipelineTask(
@@ -192,7 +439,7 @@ async def create_voice_keyboard_pipeline(transport: BaseTransport, session_id: s
         cancel_on_idle_timeout=False,  # Don't cancel on idle timeout
     )
     
-    return task, text_sender
+    return task, voice_processor
 
 
 async def run_voice_session(transport: BaseTransport, session_id: str, webrtc_connection: SmallWebRTCConnection):
@@ -200,7 +447,7 @@ async def run_voice_session(transport: BaseTransport, session_id: str, webrtc_co
     logger.info(f"🚀 Starting voice keyboard session: {session_id}")
     
     # Create pipeline
-    task, text_sender = await create_voice_keyboard_pipeline(transport, session_id, webrtc_connection)
+    task, voice_processor = await create_voice_keyboard_pipeline(transport, session_id, webrtc_connection)
     
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
@@ -547,21 +794,58 @@ async def get_index():
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
             body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
-            .container { max-width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+            .container { max-width: 1400px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
             .header { border-bottom: 2px solid #2196f3; padding-bottom: 10px; margin-bottom: 20px; }
+            
+            .main-content { display: flex; gap: 20px; }
+            .left-panel { flex: 1; min-width: 400px; }
+            .right-panel { flex: 1; min-width: 400px; }
+            
             .sessions { margin-bottom: 30px; }
             .session-item { border: 1px solid #ddd; margin: 10px 0; padding: 15px; border-radius: 5px; cursor: pointer; background: #fafafa; }
             .session-item:hover { background: #e9ecef; }
             .session-item.active { border-color: #2196f3; background: #f0f8ff; }
-            .live-transcript { border: 2px solid #2196f3; padding: 15px; border-radius: 5px; background: #f0f8ff; }
-            .message { margin: 10px 0; padding: 8px; border-radius: 4px; }
-            .transcription-message { background: #e8f5e8; border-left: 4px solid #4caf50; }
-            .typing-message { background: #e3f2fd; border-left: 4px solid #2196f3; }
+            
+            .test-section { margin-bottom: 20px; padding: 20px; background: #f8f9fa; border-radius: 8px; border: 1px solid #dee2e6; }
+            .live-transcript { border: 2px solid #2196f3; padding: 15px; border-radius: 5px; background: #f0f8ff; height: 600px; overflow: hidden; }
+            #live-messages { height: 400px; overflow-y: auto; border: 1px solid #ddd; border-radius: 4px; padding: 10px; background: #fff; }
+            
+            .message { margin: 8px 0; padding: 10px; border-radius: 6px; border-left: 5px solid; font-family: 'Segoe UI', sans-serif; }
+            .transcription-message { background: #e8f5e8; border-left-color: #4caf50; }
+            .transcription-interim { background: #f0f8e8; border-left-color: #8bc34a; font-style: italic; opacity: 0.8; }
+            .typing-message { background: #e3f2fd; border-left-color: #2196f3; }
+            .command-message { background: #fff3e0; border-left-color: #ff9800; }
+            .no-action-message { background: #fff3e0; border-left-color: #f57c00; }
+            .error-message { background: #ffebee; border-left-color: #f44336; }
+            .debug-message { background: #f3e5f5; border-left-color: #9c27b0; }
             .timestamp { font-size: 0.8em; color: #666; }
             .status { display: inline-block; padding: 4px 8px; border-radius: 12px; font-size: 0.8em; }
             .status.active { background: #e8f5e8; color: #2e7d32; }
             .status.ended { background: #ffebee; color: #c62828; }
             .status.connecting { background: #fff3e0; color: #ef6c00; }
+            
+            .latency-metrics { 
+                background: #f8f9fa; 
+                border: 1px solid #dee2e6; 
+                border-radius: 4px; 
+                padding: 10px; 
+                margin: 10px 0; 
+            }
+            .latency-row { 
+                display: flex; 
+                gap: 15px; 
+                font-family: monospace; 
+                flex-wrap: wrap;
+            }
+            .metric { 
+                background: #e9ecef; 
+                padding: 4px 8px; 
+                border-radius: 3px; 
+                font-size: 0.9em; 
+                white-space: nowrap;
+            }
+            .metric.total { background: #d1ecf1; border: 1px solid #bee5eb; }
+            .metric.avg { background: #d4edda; border: 1px solid #c3e6cb; }
         </style>
     </head>
     <body>
@@ -571,9 +855,38 @@ async def get_index():
                 <p>Real-time voice-to-keyboard transcription</p>
             </div>
             
-            <div class="live-transcript">
-                <h3>Live Session <span id="live-status" class="status">Waiting for ESP32...</span></h3>
-                <div id="live-messages"></div>
+            <div class="main-content">
+                <div class="left-panel">
+                    <!-- Test Text Box -->
+                    <div class="test-section">
+                        <h3>📝 Test Text Area</h3>
+                        <p>Use this text area to test voice keyboard commands. Try saying "ESP copy", "ESP paste", etc.</p>
+                        <textarea id="test-textarea" placeholder="Start typing here, or use voice commands to control this text area..." 
+                                 rows="10" cols="80" style="width: 100%; font-family: monospace; font-size: 14px; padding: 10px; border: 2px solid #2196f3; border-radius: 4px; resize: vertical;" autofocus></textarea>
+                    </div>
+                </div>
+                
+                <div class="right-panel">
+                    <div class="live-transcript">
+                        <h3>Live Session <span id="live-status" class="status">Waiting for ESP32...</span></h3>
+                        
+                        <!-- Latency Metrics Section -->
+                        <div class="latency-metrics">
+                            <h4>⏱️ Performance Metrics</h4>
+                            <div class="latency-row">
+                                <span class="metric">LLM: <span id="llm-latency">--</span>ms</span>
+                                <span class="metric">Processing: <span id="process-latency">--</span>ms</span>
+                                <span class="metric">Send: <span id="send-latency">--</span>ms</span>
+                                <span class="metric total">Total: <span id="total-latency">--</span>ms</span>
+                                <span class="metric avg">Avg: <span id="avg-latency">--</span>ms</span>
+                                <span class="metric">Count: <span id="request-count">0</span></span>
+                            </div>
+                        </div>
+                        
+                        <h4>🔍 Live Activity Log</h4>
+                        <div id="live-messages"></div>
+                    </div>
+                </div>
             </div>
             
             <div class="sessions">
@@ -583,6 +896,20 @@ async def get_index():
         </div>
 
         <script>
+            // Multiple approaches to ensure textarea gets focused
+            window.onload = function() {
+                setTimeout(() => {
+                    const textarea = document.getElementById('test-textarea');
+                    if (textarea) {
+                        textarea.focus();
+                        textarea.setSelectionRange(0, 0);
+                    }
+                }, 100);
+            };
+            
+            // Store messages for proper ordering
+            let messageHistory = [];
+            
             // WebSocket for live transcripts
             const ws = new WebSocket(`ws://${window.location.host}/transcript-stream`);
             const liveMessages = document.getElementById('live-messages');
@@ -599,19 +926,21 @@ async def get_index():
                 if (data.message && data.message.type === 'session_ended') {
                     liveStatus.textContent = 'Session Ended';
                     liveStatus.className = 'status ended';
-                    
-                    // Clear live messages after a short delay
-                    setTimeout(() => {
-                        liveMessages.innerHTML = '';
-                    }, 3000);
+                    addLiveMessage(data.message, 'debug');
                 } else if (data.message && data.message.type === 'session_started') {
                     liveStatus.textContent = 'Voice Session Active';
                     liveStatus.className = 'status active';
-                    liveMessages.innerHTML = '';
+                    addLiveMessage(data.message, 'debug');
                 } else if (data.message && data.message.type === 'transcription_sent') {
                     addLiveMessage(data.message, 'typing');
+                } else if (data.message && data.message.type === 'command_sent') {
+                    addLiveMessage(data.message, 'command');
+                } else if (data.message && data.message.type === 'no_action') {
+                    addLiveMessage(data.message, 'no_action');
                 } else if (data.message && data.message.type === 'transcription_interim') {
                     updateInterimMessage(data.message);
+                } else if (data.message && data.message.type === 'latency_metrics') {
+                    updateLatencyMetrics(data.message);
                 }
             };
             
@@ -631,7 +960,7 @@ async def get_index():
                             <div><strong>Listening:</strong> <span class="interim-text">${message.text}</span></div>
                             <div class="timestamp">${new Date(message.timestamp).toLocaleTimeString()}</div>
                         `;
-                        liveMessages.appendChild(currentInterimMessage);
+                        liveMessages.prepend(currentInterimMessage);
                     } else {
                         const interimText = currentInterimMessage.querySelector('.interim-text');
                         interimText.textContent = message.text;
@@ -642,22 +971,86 @@ async def get_index():
             
             function addLiveMessage(message, type) {
                 // Remove interim message when final transcription is sent
-                if (currentInterimMessage) {
+                if (currentInterimMessage && (type === 'typing' || type === 'command' || type === 'no_action')) {
                     currentInterimMessage.remove();
                     currentInterimMessage = null;
                 }
                 
                 const messageDiv = document.createElement('div');
-                const className = type === 'typing' ? 'typing-message' : 'transcription-message';
-                const label = type === 'typing' ? 'Typed' : 'Transcribed';
+                let className, label, content, icon;
+                
+                if (type === 'typing') {
+                    className = 'typing-message';
+                    label = 'Text Typed';
+                    icon = '⌨️';
+                    content = `"${message.text}"`;
+                } else if (type === 'command') {
+                    className = 'command-message';
+                    label = 'Command Executed';
+                    icon = '⚡';
+                    // Format the actions nicely
+                    const actionStrings = message.actions.map(action => {
+                        if (action.type === 'shortcut') {
+                            return action.keys.join('+');
+                        } else if (action.type === 'key') {
+                            return action.repeat ? `${action.key} (${action.repeat}x)` : action.key;
+                        }
+                        return JSON.stringify(action);
+                    });
+                    content = `"${message.text}" → ${actionStrings.join(', ')}`;
+                } else if (type === 'no_action') {
+                    className = 'no-action-message';
+                    label = 'Command Ignored';
+                    icon = '🚫';
+                    content = `"${message.text}" → ${message.message || 'No action taken'}`;
+                } else if (type === 'debug') {
+                    className = 'debug-message';
+                    label = 'System';
+                    icon = '🔧';
+                    content = message.message || message.text || 'Debug message';
+                } else {
+                    className = 'transcription-message';
+                    label = 'Transcribed';
+                    icon = '🎤';
+                    content = `"${message.text}"`;
+                }
                 
                 messageDiv.className = `message ${className}`;
+                const timestamp = message.timestamp ? new Date(message.timestamp).toLocaleTimeString() : new Date().toLocaleTimeString();
                 messageDiv.innerHTML = `
-                    <div><strong>${label}:</strong> ${message.text}</div>
-                    <div class="timestamp">${new Date(message.timestamp).toLocaleTimeString()}</div>
+                    <div><strong>${icon} ${label}:</strong> ${content}</div>
+                    <div class="timestamp">${timestamp}</div>
                 `;
-                liveMessages.appendChild(messageDiv);
-                liveMessages.scrollTop = liveMessages.scrollHeight;
+                // Add to beginning of message history
+                messageHistory.unshift({
+                    className: className,
+                    icon: icon,
+                    label: label,
+                    content: content,
+                    timestamp: timestamp
+                });
+                
+                // Keep only last 50 messages
+                if (messageHistory.length > 50) {
+                    messageHistory = messageHistory.slice(0, 50);
+                }
+                
+                // Rebuild entire message display to ensure correct ordering
+                liveMessages.innerHTML = messageHistory.map(msg => `
+                    <div class="message ${msg.className}">
+                        <div><strong>${msg.icon} ${msg.label}:</strong> ${msg.content}</div>
+                        <div class="timestamp">${msg.timestamp}</div>
+                    </div>
+                `).join('');
+            }
+            
+            function updateLatencyMetrics(metrics) {
+                document.getElementById('llm-latency').textContent = metrics.llm_latency.toFixed(1);
+                document.getElementById('process-latency').textContent = metrics.process_latency.toFixed(1);
+                document.getElementById('send-latency').textContent = metrics.send_latency.toFixed(1);
+                document.getElementById('total-latency').textContent = metrics.total_latency.toFixed(1);
+                document.getElementById('avg-latency').textContent = metrics.avg_latency.toFixed(1);
+                document.getElementById('request-count').textContent = metrics.count;
             }
             
             // Load session history (simplified - just show status)
